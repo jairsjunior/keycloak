@@ -35,12 +35,14 @@ import org.keycloak.models.UserModel;
 import org.keycloak.models.credential.OTPCredentialModel;
 import org.keycloak.models.utils.CredentialValidation;
 import org.keycloak.models.utils.FormMessage;
+import org.keycloak.models.utils.HmacOTP;
 import org.keycloak.services.messages.Messages;
 import org.keycloak.services.validation.Validation;
 import org.keycloak.utils.CredentialHelper;
 
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
+
 import java.util.stream.Stream;
 
 /**
@@ -48,6 +50,9 @@ import java.util.stream.Stream;
  * @version $Revision: 1 $
  */
 public class UpdateTotp implements RequiredActionProvider, RequiredActionFactory, CredentialRegistrator {
+
+    public static final String TOTP_SECRET = "totpSecret";
+
     @Override
     public InitiatedActionSupport initiatedActionSupport() {
         return InitiatedActionSupport.SUPPORTED;
@@ -59,57 +64,79 @@ public class UpdateTotp implements RequiredActionProvider, RequiredActionFactory
 
     @Override
     public void requiredActionChallenge(RequiredActionContext context) {
+        generateSecretIfNotPresentInSession(context);
+
         Response challenge = context.form()
                 .setAttribute("mode", context.getUriInfo().getQueryParameters().getFirst("mode"))
                 .createResponse(UserModel.RequiredAction.CONFIGURE_TOTP);
         context.challenge(challenge);
     }
 
+    private void generateSecretIfNotPresentInSession(RequiredActionContext context) {
+        if (getCurrentTotpSecret(context) == null) {
+            context.getAuthenticationSession().setAuthNote(TOTP_SECRET, HmacOTP.generateSecret(20));
+        }
+    }
+
+    private String getCurrentTotpSecret(RequiredActionContext context) {
+        return context.getAuthenticationSession().getAuthNote(TOTP_SECRET);
+    }
+
     @Override
     public void processAction(RequiredActionContext context) {
         EventBuilder event = context.getEvent();
         event.event(EventType.UPDATE_TOTP);
+
+        Response challenge;
+
         MultivaluedMap<String, String> formData = context.getHttpRequest().getDecodedFormParameters();
         String challengeResponse = formData.getFirst("totp");
-        String totpSecret = formData.getFirst("totpSecret");
-        String mode = formData.getFirst("mode");
+        String totpSecret = getCurrentTotpSecret(context);
         String userLabel = formData.getFirst("userLabel");
+        String mode = formData.getFirst("mode");
 
         OTPPolicy policy = context.getRealm().getOTPPolicy();
         OTPCredentialModel credentialModel = OTPCredentialModel.createFromPolicy(context.getRealm(), totpSecret, userLabel);
         if (Validation.isBlank(challengeResponse)) {
-            Response challenge = context.form()
+            challenge = context.form()
                     .setAttribute("mode", mode)
                     .addError(new FormMessage(Validation.FIELD_OTP_CODE, Messages.MISSING_TOTP))
                     .createResponse(UserModel.RequiredAction.CONFIGURE_TOTP);
-            context.challenge(challenge);
-            return;
-        } else if (!validateOTPCredential(context, challengeResponse, credentialModel, policy)) {
-            Response challenge = context.form()
-                    .setAttribute("mode", mode)
-                    .addError(new FormMessage(Validation.FIELD_OTP_CODE, Messages.INVALID_TOTP))
-                    .createResponse(UserModel.RequiredAction.CONFIGURE_TOTP);
+            event.error("blank_totp_code");
             context.challenge(challenge);
             return;
         }
+
+        if (!validateOTPCredential(context, challengeResponse, credentialModel, policy)) {
+            challenge = context.form()
+                    .setAttribute("mode", mode)
+                    .addError(new FormMessage(Validation.FIELD_OTP_CODE, Messages.INVALID_TOTP))
+                    .createResponse(UserModel.RequiredAction.CONFIGURE_TOTP);
+            event.error("invalid_totp_code");
+            context.challenge(challenge);
+            return;
+        }
+
         OTPCredentialProvider otpCredentialProvider = (OTPCredentialProvider) context.getSession().getProvider(CredentialProvider.class, "keycloak-otp");
         final Stream<CredentialModel> otpCredentials  = (otpCredentialProvider.isConfiguredFor(context.getRealm(), context.getUser()))
             ? context.getUser().credentialManager().getStoredCredentialsByTypeStream(OTPCredentialModel.TYPE)
             : Stream.empty();
         if (otpCredentials.count() >= 1 && Validation.isBlank(userLabel)) {
-            Response challenge = context.form()
+            challenge = context.form()
                     .setAttribute("mode", mode)
                     .addError(new FormMessage(Validation.FIELD_OTP_LABEL, Messages.MISSING_TOTP_DEVICE_NAME))
                     .createResponse(UserModel.RequiredAction.CONFIGURE_TOTP);
+            event.error("missing_totp_device_name");
             context.challenge(challenge);
             return;
         }
 
         if (!CredentialHelper.createOTPCredential(context.getSession(), context.getRealm(), context.getUser(), challengeResponse, credentialModel)) {
-            Response challenge = context.form()
+            challenge = context.form()
                     .setAttribute("mode", mode)
                     .addError(new FormMessage(Validation.FIELD_OTP_CODE, Messages.INVALID_TOTP))
                     .createResponse(UserModel.RequiredAction.CONFIGURE_TOTP);
+            event.error("invalid_totp_code");
             context.challenge(challenge);
             return;
         }
@@ -158,4 +185,5 @@ public class UpdateTotp implements RequiredActionProvider, RequiredActionFactory
     public boolean isOneTimeAction() {
         return true;
     }
+
 }
